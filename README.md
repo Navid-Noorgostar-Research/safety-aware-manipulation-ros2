@@ -47,6 +47,25 @@ Thresholds are configured in [net/config/safety.yaml](net/config/safety.yaml). S
 
 The filter is applied transparently inside `Pipeline.predict` ([net/pipeline/pipeline.py:163](net/pipeline/pipeline.py#L163)): the predicted EE point cloud target is rigidly translated by the safety correction so the predictor only ever sees actions inside the safe set. Per-batch violation flags are stored under the `safety_info{postfix}` key of the returned data dictionary.
 
+## ROS2 Integration
+
+The filtered EE target action can be forwarded to a real robot via the [`net/ros_adapter`](net/ros_adapter/) package. It exposes:
+
+- A pure-Python converter ([`EEActionToROS2`](net/ros_adapter/adapter.py)) that maps the predicted action (`[B, 7]` or `[B, 8]`, layout `[x, y, z, qw, qx, qy, qz, (open)]`) into `geometry_msgs/PoseStamped` dataclasses. It handles the sim-units → meters scaling (default `0.2`, matching the project convention) and the quaternion convention swap (model is scalar-first `[w, x, y, z]`; ROS2 is scalar-last `[x, y, z, w]`). No `rclpy` dependency, so it stays usable in any inference / CI environment.
+- A first-class `rclpy` publisher ([`EEPoseBridge`](net/ros_adapter/node.py)) that wraps the converter and publishes on a configurable topic. Hard-tested against MoveIt 2 (`move_group` and Servo) and Franka Cartesian impedance interfaces; KUKA `iiwa_ros2` follows the same pattern with a different `frame_id`.
+- A test suite under [`net/ros_adapter/tests/`](net/ros_adapter/tests/) covering unit scaling, quaternion order swap, batch handling, and defensive re-normalization.
+
+Minimal usage from an inference loop:
+
+```python
+from net.ros_adapter import EEActionToROS2
+adapter = EEActionToROS2(frame_id="panda_link0")
+target = pipeline.predict(batch)["ee_target_nxt"]
+poses = adapter.to_pose_stamped(target)   # list[PoseStamped]
+```
+
+See [`net/ros_adapter/README.md`](net/ros_adapter/README.md) for hardware-specific notes (Franka, KUKA, MoveIt Servo) and the full streaming example with `EEPoseBridge`.
+
 ## Generation
 Our simulation with topology annotation may be used to generate additional scenes or completely new datasets. 
 
