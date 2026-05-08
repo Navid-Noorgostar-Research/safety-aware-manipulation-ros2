@@ -1,0 +1,42 @@
+# Configuration 
+#
+# Units follow the rest of the codebase: 1 simulation unit = 0.2 m
+# (see augmentation.render.unit_to_meter in common.yaml).
+
+# whether the filter is applied at all (False = pass-through)
+enabled: True
+
+# nominal control timestep used to convert deltas to velocities
+dt: 0.05  # seconds
+
+# 1) Joint / workspace limits
+#    xyz workspace bounds in simulation units (slightly tighter than the query
+#    grid bounds in pipeline.py so we never command into the wall)
+workspace_bounds:
+  - [-0.30, 0.30]   # x
+  - [-0.50, 0.50]   # y
+  - [ 0.00, 0.12]   # z (above the ground plane at z=0)
+gripper_open_bounds: [0.0, 0.10]  # min/max distance between fingers
+
+# 2) Per-DoF velocity limits (mirror sim/generate/config/ee/common.yaml)
+v_lin_max: 0.25         # units / s (linear)
+v_ang_max: 0.785        # rad / s   (~45 deg/s)
+v_grip_max: 0.125       # units / s (per finger)
+
+# 3) Collision risk
+#    Trigger if the EE point cloud comes within `collision_margin` of the dough.
+#    On trigger, the translational part of the action is pulled back by
+#    `collision_pullback` (1.0 = keep, 0.0 = stay at observed).
+collision_margin: 0.01
+collision_pullback: 0.5
+
+# 4) Base speed: cap on |xyz velocity| (in addition to the per-axis cap above).
+#    This is the relevant limit for a mobile-base setup; for our static EE we
+#    keep it equal to the linear vmax.
+base_speed_max: 0.25
+
+# 5) Action smoothness: cap on linear acceleration between consecutive
+#    commanded targets. Angular smoothness is implicitly bounded by the
+#    angular velocity cap above.
+accel_lin_max: 5.0      # units / s^2
+accel_ang_max: 20.0     # rad / s^2 (reserved; not currently used)
