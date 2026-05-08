@@ -1,0 +1,16 @@
+# Simulator robot config -- the inference / training default.
+#
+# No real hardware is targeted here; the ROS2 adapter is still usable so the
+# end-to-end smoke tests can exercise the same code path as real-robot runs.
+name: sim
+kind: sim
+arm: none
+arm_dof: 0
+has_mobile_base: false
+base_frame_id: world
+ee_topic: /sim/ee_target
+sim_to_meter: 0.2
+description: >
+  Default simulator target. Matches the workspace bounds and velocity caps
+  defined in net/config/safety.yaml; no overrides needed.
+safety: {}

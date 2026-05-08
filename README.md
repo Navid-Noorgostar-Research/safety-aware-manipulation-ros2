@@ -47,6 +47,32 @@ Thresholds are configured in [net/config/safety.yaml](net/config/safety.yaml). S
 
 The filter is applied transparently inside `Pipeline.predict` ([net/pipeline/pipeline.py:163](net/pipeline/pipeline.py#L163)): the predicted EE point cloud target is rigidly translated by the safety correction so the predictor only ever sees actions inside the safe set. Per-batch violation flags are stored under the `safety_info{postfix}` key of the returned data dictionary.
 
+Tests for the filter live in [net/model/tests/test_safety_filter.py](net/model/tests/test_safety_filter.py) (per-check happy-path coverage) and [net/model/tests/test_safety_filter_extended.py](net/model/tests/test_safety_filter_extended.py) (boundary equality, mixed-batch independence, constraint ordering, idempotence, gradient flow, antipodal-quaternion handling, dtype propagation, and 7-D / 8-D shape preservation).
+
+## Hardware Abstraction
+
+The four supported deployment targets — `sim`, `franka_mobile`, `kuka_mobile`, and `husky_arm` — are described by a single [`RobotConfig`](net/hardware/robot_config.py) dataclass. Each kind ships as a built-in preset and a YAML file under [`net/config/robot/`](net/config/robot/), and consumers (the ROS2 adapter and the safety filter) read the same config so that changing the target robot only requires changing one selector:
+
+```python
+from net.hardware import load_robot_config
+from net.ros_adapter import EEActionToROS2
+
+cfg = load_robot_config("franka_mobile")            # or "kuka_mobile" / "husky_arm" / "sim"
+adapter = EEActionToROS2.from_robot_config(cfg)     # uses cfg.base_frame_id and cfg.sim_to_meter
+```
+
+A `RobotConfig` captures: arm kind and DoF, base frame name, EE / gripper / base-velocity topics, sim-to-meter scaling, mobile-base presence, and a `safety` block of optional overrides on top of [`net/config/safety.yaml`](net/config/safety.yaml). Mobile-base kinds (`franka_mobile`, `kuka_mobile`, `husky_arm`) declare a `base_cmd_topic` for `geometry_msgs/Twist` commands and a wider workspace; the fixed-base `sim` kind keeps the tabletop defaults. YAML files may reuse a preset and override only the fields that differ:
+
+```yaml
+# my_franka_lab.yaml
+kind: franka_mobile
+ee_topic: /lab1/panda/equilibrium_pose
+safety:
+  v_lin_max: 0.3
+```
+
+Then `load_robot_config("path/to/my_franka_lab.yaml")` returns a config built on top of the `franka_mobile` preset. Tests live under [`net/hardware/tests/`](net/hardware/tests/) and cover preset registration, YAML round-trips, validation, safety-override merging, and the ROS2-adapter integration for all four kinds.
+
 ## ROS2 Integration
 
 The filtered EE target action can be forwarded to a real robot via the [`net/ros_adapter`](net/ros_adapter/) package. It exposes:
@@ -65,6 +91,38 @@ poses = adapter.to_pose_stamped(target)   # list[PoseStamped]
 ```
 
 See [`net/ros_adapter/README.md`](net/ros_adapter/README.md) for hardware-specific notes (Franka, KUKA, MoveIt Servo) and the full streaming example with `EEPoseBridge`.
+
+### MoveIt2 / Twist / JointTrajectory export layer
+
+For pipelines that need richer ROS2 message types than a single `PoseStamped`, [`MoveIt2Exporter`](net/ros_adapter/exporters.py) wraps the AC-DiT output into the four channels a real ROS2 stack actually consumes:
+
+| Output | Use case | Method |
+| --- | --- | --- |
+| `geometry_msgs/PoseStamped` | direct Cartesian impedance / Servo target | `to_pose_stamped` |
+| `MoveItPoseGoal` (subset of `moveit_msgs/MotionPlanRequest`) | MoveIt2 motion-plan request with planner knobs | `to_pose_goal` |
+| `geometry_msgs/Twist` / `TwistStamped` | mobile-base `cmd_vel` | `to_twist`, `to_twist_stamped`, `twist_from_action_pair` |
+| `trajectory_msgs/JointTrajectory` | joint-space waypoints (post-IK) | `to_joint_trajectory` |
+
+Per-arm defaults — joint names, MoveIt group, end-effector link — come from the robot config, so swapping target hardware only changes the selector:
+
+```python
+from net.ros_adapter import MoveIt2Exporter
+
+exporter = MoveIt2Exporter.from_robot_config("franka_mobile")
+
+# 1) MoveIt2 motion-plan goal (Cartesian)
+goal = exporter.to_pose_goal(action, max_velocity_scaling_factor=0.5)[0]
+# goal.group_name == "panda_arm", goal.target_pose.header.frame_id == "panda_link0"
+
+# 2) Twist for the mobile base, derived from two consecutive predictions
+twist = exporter.twist_from_action_pair(prev_action, next_action, dt=0.1)
+
+# 3) JointTrajectory after running IK (joint_positions: [T, J])
+traj = exporter.to_joint_trajectory(joint_positions, dt=0.05)
+# traj.joint_names == ["panda_joint1", ..., "panda_joint7"]
+```
+
+Tests live alongside the adapter in [`net/ros_adapter/tests/test_exporters.py`](net/ros_adapter/tests/test_exporters.py) and cover per-arm joint-name lookup, planner-knob validation, batch handling, finite-difference Twist derivation (translation, rotation, identity, negative dt), JointTrajectory width / time / count consistency, and end-to-end conversion of a single AC-DiT prediction into all three message types for every supported robot.
 
 ## Generation
 Our simulation with topology annotation may be used to generate additional scenes or completely new datasets. 

@@ -1,0 +1,27 @@
+# Franka Panda 7-DoF arm on a differential-drive mobile base.
+#
+# Cartesian pose commands go to the Franka Cartesian impedance controller's
+# equilibrium-pose topic. Mobile base accepts a Twist on /mobile_base/cmd_vel.
+name: franka_mobile
+kind: franka_mobile
+arm: franka_panda
+arm_dof: 7
+has_mobile_base: true
+base_frame_id: panda_link0
+mobile_base_frame_id: odom
+ee_topic: /panda/equilibrium_pose
+gripper_topic: /panda/franka_gripper/move
+base_cmd_topic: /mobile_base/cmd_vel
+sim_to_meter: 0.2
+description: >
+  Franka Panda mounted on a mobile base. The arm controller exposes the
+  standard Cartesian impedance interface; the mobile base is a generic
+  differential-drive platform speaking geometry_msgs/Twist on cmd_vel.
+safety:
+  # mobile reach extends past the tabletop workspace
+  workspace_bounds:
+    - [-2.0, 2.0]
+    - [-2.0, 2.0]
+    - [ 0.0, 1.5]
+  v_lin_max: 0.5
+  base_speed_max: 0.8

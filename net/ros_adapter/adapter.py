@@ -77,6 +77,22 @@ class EEActionToROS2:
         self.sim_to_meter = float(sim_to_meter)
         self.quat_eps = float(quat_eps)
 
+    @classmethod
+    def from_robot_config(cls, robot, *, quat_eps: float = 1e-8) -> "EEActionToROS2":
+        """Construct an adapter from a :class:`net.hardware.RobotConfig` (or its name).
+
+        ``robot`` may be a ``RobotConfig`` instance, a preset name like
+        ``"franka_mobile"``, or anything else accepted by
+        :func:`net.hardware.load_robot_config`.
+        """
+        from net.hardware import load_robot_config  # local import to avoid cycle
+        cfg = load_robot_config(robot)
+        return cls(
+            frame_id=cfg.base_frame_id,
+            sim_to_meter=cfg.sim_to_meter,
+            quat_eps=quat_eps,
+        )
+
     def to_pose_stamped(
         self,
         action: ActionLike,

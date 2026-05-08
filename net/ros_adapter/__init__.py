@@ -9,15 +9,40 @@ The optional rclpy-based publisher lives in :mod:`net.ros_adapter.node` and is
 imported on demand so the rest of the package stays importable without ROS2.
 """
 
-from .messages import Header, Point, Pose, PoseStamped, Quaternion, Time
+from .messages import (
+    Duration,
+    Header,
+    JointTrajectory,
+    JointTrajectoryPoint,
+    MoveItPoseGoal,
+    Point,
+    Pose,
+    PoseStamped,
+    Quaternion,
+    Time,
+    Twist,
+    TwistStamped,
+    Vector3,
+)
 from .adapter import EEActionToROS2
+from .exporters import ARM_DEFAULTS, MoveIt2Exporter, arm_defaults
 
 __all__ = [
+    "ARM_DEFAULTS",
+    "Duration",
     "EEActionToROS2",
     "Header",
+    "JointTrajectory",
+    "JointTrajectoryPoint",
+    "MoveIt2Exporter",
+    "MoveItPoseGoal",
     "Point",
     "Pose",
     "PoseStamped",
     "Quaternion",
     "Time",
+    "Twist",
+    "TwistStamped",
+    "Vector3",
+    "arm_defaults",
 ]

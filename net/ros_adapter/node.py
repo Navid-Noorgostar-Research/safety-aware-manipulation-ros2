@@ -88,6 +88,7 @@ class EEPoseBridge(Node):
             rclpy.init()
         super().__init__(node_name)
         self.adapter = EEActionToROS2(frame_id=frame_id, sim_to_meter=sim_to_meter)
+        self.topic = topic
         qos = QoSProfile(
             reliability=ReliabilityPolicy.RELIABLE,
             history=HistoryPolicy.KEEP_LAST,
@@ -95,6 +96,31 @@ class EEPoseBridge(Node):
         )
         self.pub = self.create_publisher(RosPoseStamped, topic, qos)
         self.get_logger().info(f"EEPoseBridge publishing PoseStamped on '{topic}' (frame={frame_id})")
+
+    @classmethod
+    def from_robot_config(
+        cls,
+        robot,
+        *,
+        topic: Optional[str] = None,
+        queue_depth: int = 10,
+        node_name: str = "ee_pose_bridge",
+    ) -> "EEPoseBridge":
+        """Build a bridge from a :class:`net.hardware.RobotConfig` (or its name).
+
+        ``robot`` accepts the same inputs as
+        :func:`net.hardware.load_robot_config`. ``topic`` defaults to the
+        config's ``ee_topic`` but can be overridden when remapping.
+        """
+        from net.hardware import load_robot_config  # local import to avoid cycle
+        cfg = load_robot_config(robot)
+        return cls(
+            topic=topic if topic is not None else cfg.ee_topic,
+            frame_id=cfg.base_frame_id,
+            sim_to_meter=cfg.sim_to_meter,
+            queue_depth=queue_depth,
+            node_name=node_name,
+        )
 
     def publish(self, action, stamp: Optional[float] = None) -> int:
         """Convert and publish; returns the number of messages sent."""

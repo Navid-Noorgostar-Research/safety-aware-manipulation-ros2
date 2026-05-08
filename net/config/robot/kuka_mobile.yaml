@@ -1,0 +1,27 @@
+# KUKA iiwa14 7-DoF arm on a mobile base.
+#
+# Same Cartesian-pose interface pattern as Franka via iiwa_ros2; differs in
+# the base frame name and the Cartesian topic. FRI-bridged Cartesian
+# controllers also accept this PoseStamped channel.
+name: kuka_mobile
+kind: kuka_mobile
+arm: kuka_iiwa14
+arm_dof: 7
+has_mobile_base: true
+base_frame_id: iiwa_link_0
+mobile_base_frame_id: odom
+ee_topic: /iiwa/cartesian_pose
+gripper_topic: /iiwa/gripper/command
+base_cmd_topic: /mobile_base/cmd_vel
+sim_to_meter: 0.2
+description: >
+  KUKA iiwa14 on a mobile base. iiwa_ros2 exposes cartesian_pose as the
+  Cartesian command channel; the mobile base accepts a Twist on cmd_vel.
+safety:
+  workspace_bounds:
+    - [-2.0, 2.0]
+    - [-2.0, 2.0]
+    - [ 0.0, 1.5]
+  v_lin_max: 0.5
+  v_ang_max: 1.0
+  base_speed_max: 0.8

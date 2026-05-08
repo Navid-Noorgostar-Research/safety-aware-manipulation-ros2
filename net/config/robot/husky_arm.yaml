@@ -1,0 +1,29 @@
+# Clearpath Husky A200 with a UR5 6-DoF arm and Robotiq 2F gripper.
+#
+# Husky's velocity controller publishes Twist commands on its own namespaced
+# topic; the UR5 is mounted to the Husky's top plate and takes Cartesian-
+# pose commands in ur_arm_base_link.
+name: husky_arm
+kind: husky_arm
+arm: ur5
+arm_dof: 6
+has_mobile_base: true
+base_frame_id: ur_arm_base_link
+mobile_base_frame_id: odom
+ee_topic: /ur_arm/cartesian_pose
+gripper_topic: /robotiq_2f_gripper/command
+base_cmd_topic: /husky_velocity_controller/cmd_vel
+sim_to_meter: 0.2
+description: >
+  Clearpath Husky A200 with a UR5 arm and Robotiq 2F gripper. The Husky has
+  a much larger outdoor workspace than a tabletop arm; the per-axis
+  workspace bounds capture the navigable area, while v_lin_max constrains
+  the EE-relative motion.
+safety:
+  workspace_bounds:
+    - [-3.0, 3.0]
+    - [-3.0, 3.0]
+    - [ 0.0, 1.2]
+  v_lin_max: 0.4
+  base_speed_max: 1.0
+  accel_lin_max: 2.0
