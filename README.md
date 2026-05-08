@@ -128,10 +128,11 @@ Tests live alongside the adapter in [`net/ros_adapter/tests/test_exporters.py`](
 
 A small declarative ablation framework lives in [`net/ablation/`](net/ablation/) so that "every constraint contributes" claims are reproducible. Each study is a `(base_config, list[AblationConfig], seed)` triple; calling `study.run(evaluator)` produces an [`AblationResults`](net/ablation/ablation.py) table that renders as a paper-ready Markdown table or CSV.
 
-The two studies that ship are:
+Three studies ship:
 
 - [`safety_filter_study`](net/ablation/presets.py) — ablates each of the five safety constraints (joint, velocity, base speed, smoothness, collision) plus a `disabled` lower bound. The `safety_filter_evaluator` runs the actual `SafetyAwareActionFilter` on a seeded synthetic dataset that spans every violation mode and reports per-constraint flag rates and mean L2 correction magnitude.
 - [`robot_workspace_study`](net/ablation/presets.py) — sweeps workspace tightness on the default tabletop robot.
+- [`model_ablation_study`](net/ablation/presets.py) — ablates **3D input**, **mobility-to-body conditioning**, and the **safety filter** on the action path. Ships scaffolded: until you register a model runner via `set_model_runner`, the evaluator returns `NaN` for every metric so the table layout is reproducible without trained weights or a dataset on the current machine. Plug in your runner on the lab box to fill in the cells.
 
 Run from the CLI:
 
@@ -139,6 +140,7 @@ Run from the CLI:
 python -m net.ablation.run --study safety_filter
 python -m net.ablation.run --study robot_workspace --format csv --out results.csv
 python -m net.ablation.run --study safety_filter --seed 42 --out ablation.md
+python -m net.ablation.run --study model_ablation     # NaN cells until runner registered
 ```
 
 Example output (seed 0):
@@ -159,6 +161,34 @@ seed: 0
 ```
 
 Each `no_X` row drops only its own constraint to 0 while leaving the others firing on the same seeded data — the visible diagonal is the evidence that each check contributes independently. Tests in [`net/ablation/tests/`](net/ablation/tests/) lock in this property along with framework-level invariants (declaration-order stability, per-row seed independence, deterministic reruns, strict-mode unknown-key validation, Markdown/CSV column alignment, evaluator type checks).
+
+### Model ablation (3D input / mobility-to-body / safety filter)
+
+[`model_ablation_study`](net/ablation/presets.py) ships scaffolded with four rows:
+
+| Ablation | Override | Means |
+| --- | --- | --- |
+| `full` | _(none)_ | full model: 4-dim input + both-EE conditioning + safety filter |
+| `no_3d_input` | `input_dim: 1` | drop the spatial xyz channels (keep per-point label only) |
+| `no_mobility_conditioning` | `ee_conditioning: 'observed'` | drop target-EE conditioning (no mobility→body coupling) |
+| `no_safety_filter` | `safety_enabled: False` | bypass `SafetyAwareActionFilter` on the action path |
+
+Until you call `set_model_runner(...)`, every cell renders as `NaN`. To plug in a real run, register a callable that takes the merged effective config (a flat dict containing the keys above) and a per-row seed, and returns a dict with exactly the keys in `MODEL_METRIC_NAMES` (`chamfer_l1`, `iou`, `topology_accuracy`, `safety_violation_rate`, `mean_correction`):
+
+```python
+from net.ablation import set_model_runner, model_ablation_evaluator, model_ablation_study
+
+def my_runner(cfg, seed):
+    pipeline = build_pipeline(input_dim=cfg["input_dim"],
+                              ee_shape=cfg["ee_conditioning"],
+                              safety_enabled=cfg["safety_enabled"])
+    return evaluate_on_held_out(pipeline, seed)   # returns the 5 keys
+
+set_model_runner(my_runner)
+print(model_ablation_study(seed=0).run(model_ablation_evaluator).to_markdown())
+```
+
+The evaluator validates the runner's output (missing or extra keys raise immediately), so a misconfigured run on the lab box fails loudly rather than silently producing a half-filled table.
 
 Custom studies are a one-liner:
 

@@ -17,13 +17,27 @@ import sys
 from typing import Callable, Dict
 
 from .ablation import AblationStudy
-from .metrics import safety_filter_evaluator
-from .presets import robot_workspace_study, safety_filter_study
+from .metrics import model_ablation_evaluator, safety_filter_evaluator
+from .presets import (
+    model_ablation_study,
+    robot_workspace_study,
+    safety_filter_study,
+)
 
 
 _STUDIES: Dict[str, Callable[[int], AblationStudy]] = {
     "safety_filter": safety_filter_study,
     "robot_workspace": robot_workspace_study,
+    "model_ablation": model_ablation_study,
+}
+
+# Each study uses a specific evaluator -- the safety-filter studies share
+# `safety_filter_evaluator`; the model study uses the scaffolded model
+# evaluator that returns NaN until a runner is registered.
+_EVALUATORS = {
+    "safety_filter": safety_filter_evaluator,
+    "robot_workspace": safety_filter_evaluator,
+    "model_ablation": model_ablation_evaluator,
 }
 
 
@@ -48,7 +62,7 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
 
     study = _STUDIES[args.study](seed=args.seed)
-    results = study.run(safety_filter_evaluator)
+    results = study.run(_EVALUATORS[args.study])
     text = results.to_markdown() if args.format == "md" else results.to_csv()
 
     if args.out is None:

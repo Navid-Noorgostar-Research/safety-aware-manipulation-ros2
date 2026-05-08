@@ -28,18 +28,33 @@ Canonical studies (in :mod:`net.ablation.presets`):
 """
 
 from .ablation import AblationConfig, AblationResults, AblationStudy, MetricRow
-from .metrics import safety_filter_evaluator
-from .presets import robot_workspace_study, safety_filter_study
+from .metrics import (
+    MODEL_METRIC_NAMES,
+    get_model_runner,
+    model_ablation_evaluator,
+    safety_filter_evaluator,
+    set_model_runner,
+)
+from .presets import (
+    model_ablation_study,
+    robot_workspace_study,
+    safety_filter_study,
+)
 from .report import to_csv, to_markdown
 
 __all__ = [
     "AblationConfig",
     "AblationResults",
     "AblationStudy",
+    "MODEL_METRIC_NAMES",
     "MetricRow",
+    "get_model_runner",
+    "model_ablation_evaluator",
+    "model_ablation_study",
     "robot_workspace_study",
     "safety_filter_evaluator",
     "safety_filter_study",
+    "set_model_runner",
     "to_csv",
     "to_markdown",
 ]

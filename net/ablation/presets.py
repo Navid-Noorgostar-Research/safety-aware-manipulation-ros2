@@ -8,8 +8,6 @@ quoted in the README.
 
 from __future__ import annotations
 
-from typing import Mapping
-
 from .ablation import AblationConfig, AblationStudy
 
 
@@ -82,6 +80,78 @@ def safety_filter_study(seed: int = 0) -> AblationStudy:
                 name="disabled",
                 overrides={"enabled": False},
                 description="bypass filter entirely (lower bound)",
+            ),
+        ],
+        seed=seed,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Model-level ablation: 3D input, mobility-to-body conditioning, safety filter.
+#
+# The base config below is intentionally minimal -- it only declares the
+# three knobs the rows ablate. A real model runner registered via
+# `set_model_runner` is expected to consume these keys (or whatever super-
+# set it needs) when it materializes the model + dataset.
+# ---------------------------------------------------------------------------
+
+
+# Defaults match the project's full-stack settings:
+#   input_dim=4         -> [xyz, label] point features (xyzl)
+#   ee_conditioning=both -> see both observed and target EE shape
+#                          (the project's analog of "mobility-to-body" cond.)
+#   safety_enabled=True  -> SafetyAwareActionFilter active on the action path
+MODEL_ABLATION_BASE = dict(
+    input_dim=4,
+    ee_conditioning="both",
+    safety_enabled=True,
+)
+
+
+def model_ablation_study(seed: int = 0) -> AblationStudy:
+    """Standard model-level ablation referenced in the README.
+
+    Rows:
+
+    - ``full``: the production configuration (4-dim input, both-EE
+      conditioning, safety filter on).
+    - ``no_3d_input``: drops the spatial xyz channels from the per-point
+      feature vector by setting ``input_dim=1`` (label-only). This is the
+      project's analog of "turn off 3D input" -- the model still sees the
+      point cloud topology label, but not the coordinates.
+    - ``no_mobility_conditioning``: turns off the target-EE channel by
+      setting ``ee_conditioning='observed'`` so the predictor only sees
+      the current EE state, not the commanded target. This corresponds to
+      removing the mobility-to-body conditioning path in AC-DiT-style
+      models -- the most direct analog in this codebase.
+    - ``no_safety_filter``: bypasses the safety filter entirely.
+
+    Until :func:`net.ablation.set_model_runner` is called the evaluator
+    returns ``NaN`` for every metric so the table layout reproduces
+    without weights or data.
+    """
+    return AblationStudy(
+        name="model_ablation",
+        base_config=MODEL_ABLATION_BASE,
+        ablations=[
+            AblationConfig(
+                name="full",
+                description="full model: 4-dim input + both-EE cond + safety filter",
+            ),
+            AblationConfig(
+                name="no_3d_input",
+                overrides={"input_dim": 1},
+                description="ablate 3D xyz channels (keep per-point label only)",
+            ),
+            AblationConfig(
+                name="no_mobility_conditioning",
+                overrides={"ee_conditioning": "observed"},
+                description="drop target-EE conditioning (no mobility->body coupling)",
+            ),
+            AblationConfig(
+                name="no_safety_filter",
+                overrides={"safety_enabled": False},
+                description="bypass SafetyAwareActionFilter on the action path",
             ),
         ],
         seed=seed,

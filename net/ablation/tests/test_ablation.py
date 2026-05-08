@@ -473,3 +473,186 @@ def test_cli_unknown_study_rejected():
     from net.ablation.run import main
     with pytest.raises(SystemExit):
         main(["--study", "frobnicator"])
+
+
+# ---------------------------------------------------------------------------
+# Model-level ablation: scaffold + runner registration
+# ---------------------------------------------------------------------------
+
+
+from net.ablation import (  # noqa: E402
+    MODEL_METRIC_NAMES,
+    get_model_runner,
+    model_ablation_evaluator,
+    model_ablation_study,
+    set_model_runner,
+)
+
+
+@pytest.fixture(autouse=True)
+def _reset_model_runner():
+    """Always start tests with the runner reset to the NaN stub."""
+    set_model_runner(None)
+    yield
+    set_model_runner(None)
+
+
+def test_model_ablation_metric_names_are_documented():
+    expected = (
+        "chamfer_l1", "iou", "topology_accuracy",
+        "safety_violation_rate", "mean_correction",
+    )
+    assert MODEL_METRIC_NAMES == expected
+
+
+def test_model_ablation_study_has_four_rows():
+    s = model_ablation_study(seed=0)
+    names = [a.name for a in s.ablations]
+    assert names == [
+        "full", "no_3d_input", "no_mobility_conditioning", "no_safety_filter",
+    ]
+
+
+def test_model_ablation_study_full_row_is_baseline():
+    s = model_ablation_study(seed=0)
+    full = s.ablations[0]
+    assert full.overrides == {}
+
+
+def test_model_ablation_no_3d_input_drops_to_label_only():
+    s = model_ablation_study()
+    row = next(a for a in s.ablations if a.name == "no_3d_input")
+    assert row.overrides == {"input_dim": 1}
+
+
+def test_model_ablation_no_mobility_conditioning_uses_observed_only():
+    s = model_ablation_study()
+    row = next(a for a in s.ablations if a.name == "no_mobility_conditioning")
+    assert row.overrides == {"ee_conditioning": "observed"}
+
+
+def test_model_ablation_no_safety_filter_disables_safety_flag():
+    s = model_ablation_study()
+    row = next(a for a in s.ablations if a.name == "no_safety_filter")
+    assert row.overrides == {"safety_enabled": False}
+
+
+def test_model_evaluator_returns_nan_when_no_runner_registered():
+    metrics = model_ablation_evaluator({"input_dim": 4}, seed=0)
+    assert set(metrics.keys()) == set(MODEL_METRIC_NAMES)
+    for k, v in metrics.items():
+        assert v != v, f"{k} expected NaN, got {v}"
+
+
+def test_model_evaluator_raises_for_non_callable_runner():
+    with pytest.raises(TypeError, match="callable or None"):
+        set_model_runner(42)  # type: ignore[arg-type]
+
+
+def test_model_evaluator_uses_registered_runner():
+    captured = {}
+    def runner(cfg, seed):
+        captured["cfg"] = dict(cfg)
+        captured["seed"] = seed
+        return {k: 1.0 for k in MODEL_METRIC_NAMES}
+    set_model_runner(runner)
+    metrics = model_ablation_evaluator({"input_dim": 1}, seed=5)
+    assert captured == {"cfg": {"input_dim": 1}, "seed": 5}
+    assert all(metrics[k] == 1.0 for k in MODEL_METRIC_NAMES)
+
+
+def test_model_evaluator_rejects_runner_with_missing_metrics():
+    set_model_runner(lambda c, s: {"chamfer_l1": 0.1})
+    with pytest.raises(ValueError, match="missing required metrics"):
+        model_ablation_evaluator({}, seed=0)
+
+
+def test_model_evaluator_rejects_runner_with_extra_metrics():
+    set_model_runner(lambda c, s: {**{k: 0.0 for k in MODEL_METRIC_NAMES}, "bonus": 1.0})
+    with pytest.raises(ValueError, match="unexpected metrics"):
+        model_ablation_evaluator({}, seed=0)
+
+
+def test_model_evaluator_rejects_non_dict_runner_output():
+    set_model_runner(lambda c, s: [1.0, 2.0])  # type: ignore[return-value]
+    with pytest.raises(TypeError, match="must return a dict"):
+        model_ablation_evaluator({}, seed=0)
+
+
+def test_model_evaluator_coerces_metric_values_to_float():
+    set_model_runner(lambda c, s: {k: 1 for k in MODEL_METRIC_NAMES})
+    metrics = model_ablation_evaluator({}, seed=0)
+    assert all(isinstance(v, float) for v in metrics.values())
+
+
+def test_get_model_runner_round_trips():
+    assert get_model_runner() is None
+    fn = lambda c, s: {k: 0.0 for k in MODEL_METRIC_NAMES}  # noqa: E731
+    set_model_runner(fn)
+    assert get_model_runner() is fn
+    set_model_runner(None)
+    assert get_model_runner() is None
+
+
+def test_model_ablation_study_runs_with_stub_evaluator():
+    """End-to-end: study.run produces a NaN-only table without crashing."""
+    results = model_ablation_study(seed=0).run(model_ablation_evaluator)
+    assert len(results) == 4
+    for r in results:
+        for v in r.metrics.values():
+            assert v != v  # NaN
+
+
+def test_model_ablation_study_runs_with_registered_runner():
+    """End-to-end: registered runner sees the merged effective config."""
+    seen = []
+    def runner(cfg, seed):
+        seen.append((dict(cfg), seed))
+        return {k: float(seed) for k in MODEL_METRIC_NAMES}
+    set_model_runner(runner)
+    results = model_ablation_study(seed=10).run(model_ablation_evaluator)
+    # Each row sees a merged config: full base for "full", overrides applied
+    # for the others.
+    cfgs = [c for c, _ in seen]
+    assert cfgs[0]["input_dim"] == 4 and cfgs[0]["ee_conditioning"] == "both"
+    assert cfgs[1]["input_dim"] == 1                    # no_3d_input
+    assert cfgs[2]["ee_conditioning"] == "observed"     # no_mobility_conditioning
+    assert cfgs[3]["safety_enabled"] is False           # no_safety_filter
+    # per-row seeds are 10, 11, 12, 13
+    seeds = [s for _, s in seen]
+    assert seeds == [10, 11, 12, 13]
+    # metrics propagate
+    assert results["full"].metrics["chamfer_l1"] == 10.0
+    assert results["no_safety_filter"].metrics["mean_correction"] == 13.0
+
+
+def test_model_ablation_markdown_renders_nan_cells():
+    results = model_ablation_study(seed=0).run(model_ablation_evaluator)
+    md = results.to_markdown()
+    # one NaN per metric cell per row
+    assert md.count("NaN") >= len(MODEL_METRIC_NAMES) * len(results)
+    # row labels still show up
+    for r in results:
+        assert f"| {r.name}" in md
+
+
+def test_cli_model_ablation_writes_nan_table_to_stdout(capsys):
+    from net.ablation.run import main
+    rc = main(["--study", "model_ablation", "--format", "md", "--seed", "0"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "## Ablation: model_ablation" in out
+    assert "no_3d_input" in out
+    assert "no_mobility_conditioning" in out
+    assert "no_safety_filter" in out
+    assert "NaN" in out  # default stub renders NaN
+
+
+def test_cli_model_ablation_csv_includes_model_metric_columns(capsys):
+    from net.ablation.run import main
+    rc = main(["--study", "model_ablation", "--format", "csv", "--seed", "0"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert out.startswith("ablation,")
+    for m in MODEL_METRIC_NAMES:
+        assert m in out

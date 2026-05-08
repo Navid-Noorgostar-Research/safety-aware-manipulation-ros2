@@ -1,26 +1,36 @@
 """Evaluators that the ablation framework can plug into.
 
-Currently ships one evaluator: :func:`safety_filter_evaluator`. It runs the
-:class:`net.model.safety_filter.SafetyAwareActionFilter` on a seeded
-synthetic dataset that spans all five violation modes, and reports the
-fraction of samples flagged for each constraint plus the mean L2
-correction magnitude on position.
+Two evaluators ship:
 
-Synthetic-data design (frozen for reproducibility):
+- :func:`safety_filter_evaluator` -- runs the actual
+  :class:`net.model.safety_filter.SafetyAwareActionFilter` on a seeded
+  synthetic dataset that spans all five violation modes, and reports the
+  fraction of samples flagged for each constraint plus the mean L2
+  correction magnitude on position.
+- :func:`model_ablation_evaluator` -- a *scaffolded* evaluator for
+  model-level ablations (3D input, mobility-to-body conditioning, safety
+  filter on/off). Until you register a runner via
+  :func:`set_model_runner`, it returns ``NaN`` for every metric so the
+  paper-style table renders with the correct layout while the lab box
+  fills in real numbers later.
+
+Synthetic-data design for the safety-filter evaluator (frozen for
+reproducibility):
 
 - ``observed`` poses are sampled inside the workspace box (clamped to the
   box defined in ``net/config/safety.yaml``).
 - ``target`` poses are sampled with deliberately wide tails so each
   constraint fires on a non-trivial fraction of samples even with default
   thresholds.
-- ``ee_pts`` are fixed at the target translation and ``obj_pts`` at the
-  origin, so the collision distance equals the target's translation norm.
+- ``ee_pts`` is split half/half: half the samples sit at the target
+  translation (far from the dough-at-origin), the other half are placed
+  within ~5 mm of the origin so the collision check actually fires.
 """
 
 from __future__ import annotations
 
 from types import SimpleNamespace
-from typing import Any, Dict, Mapping
+from typing import Any, Callable, Dict, Mapping, Optional
 
 
 def _build_filter(cfg: Mapping[str, Any]):
@@ -115,3 +125,88 @@ def safety_filter_evaluator(config: Mapping[str, Any], seed: int) -> Dict[str, f
         any_violations=info["any_violation"].sum().item() / n,
         mean_correction=correction,
     )
+
+
+# ---------------------------------------------------------------------------
+# Model-level ablation: scaffolded evaluator.
+#
+# The metrics below are the canonical headline numbers for this project's
+# dynamics predictor. They are reported in the order a paper appendix would
+# present them: shape fidelity, semantic accuracy, then the safety-related
+# numbers that justify the filter being on the action path.
+# ---------------------------------------------------------------------------
+
+MODEL_METRIC_NAMES = (
+    "chamfer_l1",            # mean L1 chamfer between predicted and GT shape
+    "iou",                   # voxel IoU on the predicted occupancy grid
+    "topology_accuracy",     # 1 if predicted genus == GT genus, averaged
+    "safety_violation_rate", # how often the safety filter intervenes downstream
+    "mean_correction",       # mean L2 correction magnitude on EE position
+)
+
+
+# Pluggable runner: register a callable taking ``(effective_config, seed)``
+# and returning a dict keyed by ``MODEL_METRIC_NAMES``. Until set, the
+# evaluator returns NaN for every metric so the table layout reproduces
+# without weights or data on hand.
+_MODEL_RUNNER: Optional[Callable[[Mapping[str, Any], int], Dict[str, float]]] = None
+
+
+def set_model_runner(
+    fn: Optional[Callable[[Mapping[str, Any], int], Dict[str, float]]],
+) -> None:
+    """Register the runner the model-ablation evaluator delegates to.
+
+    The runner receives the effective ablation config (already merged from
+    the base + overrides) and a per-row seed. It must return a dict whose
+    keys are exactly :data:`MODEL_METRIC_NAMES`. Pass ``None`` to reset to
+    the NaN stub.
+    """
+    global _MODEL_RUNNER
+    if fn is not None and not callable(fn):
+        raise TypeError(f"model runner must be callable or None, got {type(fn).__name__}.")
+    _MODEL_RUNNER = fn
+
+
+def get_model_runner():
+    """Return the currently registered runner (or ``None``)."""
+    return _MODEL_RUNNER
+
+
+def _stub_metrics() -> Dict[str, float]:
+    nan = float("nan")
+    return {k: nan for k in MODEL_METRIC_NAMES}
+
+
+def model_ablation_evaluator(
+    config: Mapping[str, Any], seed: int,
+) -> Dict[str, float]:
+    """Scaffolded evaluator for model-level ablations.
+
+    By default this returns ``NaN`` for every metric in
+    :data:`MODEL_METRIC_NAMES`, so the ablation table layout is
+    reproducible without trained weights or a dataset on the current
+    machine. To produce real numbers, register a runner via
+    :func:`set_model_runner`; it is invoked with the same arguments and
+    must return a dict keyed by ``MODEL_METRIC_NAMES``.
+    """
+    runner = _MODEL_RUNNER
+    if runner is None:
+        return _stub_metrics()
+    out = runner(config, seed)
+    if not isinstance(out, dict):
+        raise TypeError(
+            f"model runner must return a dict, got {type(out).__name__}."
+        )
+    missing = set(MODEL_METRIC_NAMES) - set(out.keys())
+    if missing:
+        raise ValueError(
+            f"model runner output is missing required metrics: {sorted(missing)}."
+        )
+    extra = set(out.keys()) - set(MODEL_METRIC_NAMES)
+    if extra:
+        raise ValueError(
+            f"model runner returned unexpected metrics: {sorted(extra)}. "
+            f"Expected exactly {list(MODEL_METRIC_NAMES)}."
+        )
+    return {k: float(out[k]) for k in MODEL_METRIC_NAMES}
