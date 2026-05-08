@@ -124,6 +124,60 @@ traj = exporter.to_joint_trajectory(joint_positions, dt=0.05)
 
 Tests live alongside the adapter in [`net/ros_adapter/tests/test_exporters.py`](net/ros_adapter/tests/test_exporters.py) and cover per-arm joint-name lookup, planner-knob validation, batch handling, finite-difference Twist derivation (translation, rotation, identity, negative dt), JointTrajectory width / time / count consistency, and end-to-end conversion of a single AC-DiT prediction into all three message types for every supported robot.
 
+## Ablation Studies
+
+A small declarative ablation framework lives in [`net/ablation/`](net/ablation/) so that "every constraint contributes" claims are reproducible. Each study is a `(base_config, list[AblationConfig], seed)` triple; calling `study.run(evaluator)` produces an [`AblationResults`](net/ablation/ablation.py) table that renders as a paper-ready Markdown table or CSV.
+
+The two studies that ship are:
+
+- [`safety_filter_study`](net/ablation/presets.py) — ablates each of the five safety constraints (joint, velocity, base speed, smoothness, collision) plus a `disabled` lower bound. The `safety_filter_evaluator` runs the actual `SafetyAwareActionFilter` on a seeded synthetic dataset that spans every violation mode and reports per-constraint flag rates and mean L2 correction magnitude.
+- [`robot_workspace_study`](net/ablation/presets.py) — sweeps workspace tightness on the default tabletop robot.
+
+Run from the CLI:
+
+```bash
+python -m net.ablation.run --study safety_filter
+python -m net.ablation.run --study robot_workspace --format csv --out results.csv
+python -m net.ablation.run --study safety_filter --seed 42 --out ablation.md
+```
+
+Example output (seed 0):
+
+```
+## Ablation: safety_filter
+seed: 0
+
+| Ablation           | joint_violations | velocity_violations | base_speed_violations | smoothness_violations | collision_violations | any_violations | mean_correction | Description                            |
+| ------------------ | ---------------- | ------------------- | --------------------- | --------------------- | -------------------- | -------------- | --------------- | -------------------------------------- |
+| full               | 0.8438           | 1.0000              | 1.0000                | 0.5938                | 0.5000               | 1.0000         | 0.3130          | all five constraints active (baseline) |
+| no_joint_limits    | 0.0000           | 1.0000              | 0.9961                | 0.5039                | 0.5000               | 1.0000         | 0.3043          | disable workspace + gripper clamps     |
+| no_velocity_limits | 0.7891           | 0.0000              | 1.0000                | 0.7461                | 0.5000               | 1.0000         | 0.3087          | disable per-DoF velocity caps          |
+| no_base_speed      | 0.7773           | 1.0000              | 0.0000                | 1.0000                | 0.5000               | 1.0000         | 0.3037          | disable scalar |xyz| velocity cap      |
+| no_smoothness      | 0.7773           | 1.0000              | 1.0000                | 0.0000                | 0.5000               | 1.0000         | 0.2767          | disable acceleration smoothness cap    |
+| no_collision       | 0.8047           | 1.0000              | 1.0000                | 0.5820                | 0.0000               | 1.0000         | 0.3026          | disable collision pullback             |
+| disabled           | 0.0000           | 0.0000              | 0.0000                | 0.0000                | 0.0000               | 0.0000         | 0.0000          | bypass filter entirely (lower bound)   |
+```
+
+Each `no_X` row drops only its own constraint to 0 while leaving the others firing on the same seeded data — the visible diagonal is the evidence that each check contributes independently. Tests in [`net/ablation/tests/`](net/ablation/tests/) lock in this property along with framework-level invariants (declaration-order stability, per-row seed independence, deterministic reruns, strict-mode unknown-key validation, Markdown/CSV column alignment, evaluator type checks).
+
+Custom studies are a one-liner:
+
+```python
+from net.ablation import AblationConfig, AblationStudy, safety_filter_evaluator
+
+study = AblationStudy(
+    name="my_collision_sweep",
+    base_config={...},
+    ablations=[
+        AblationConfig("margin_1mm",  overrides={"collision_margin": 0.001}),
+        AblationConfig("margin_5mm",  overrides={"collision_margin": 0.005}),
+        AblationConfig("margin_10mm", overrides={"collision_margin": 0.01}),
+    ],
+    seed=0,
+)
+print(study.run(safety_filter_evaluator).to_markdown())
+```
+
 ## Generation
 Our simulation with topology annotation may be used to generate additional scenes or completely new datasets. 
 
