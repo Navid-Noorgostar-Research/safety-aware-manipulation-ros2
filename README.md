@@ -124,6 +124,53 @@ traj = exporter.to_joint_trajectory(joint_positions, dt=0.05)
 
 Tests live alongside the adapter in [`net/ros_adapter/tests/test_exporters.py`](net/ros_adapter/tests/test_exporters.py) and cover per-arm joint-name lookup, planner-knob validation, batch handling, finite-difference Twist derivation (translation, rotation, identity, negative dt), JointTrajectory width / time / count consistency, and end-to-end conversion of a single AC-DiT prediction into all three message types for every supported robot.
 
+## Closed-Loop Replanning
+
+[`net/control/`](net/control/) wraps the dynamics predictor into a receding-horizon controller: instead of predicting one long action sequence and executing it open-loop, the replanner re-observes after each step and asks the predictor for a fresh horizon.
+
+```python
+from net.control import ReplannerConfig, run_closed_loop, run_open_loop, compare_loops
+
+cfg = ReplannerConfig(horizon=8, execute_steps=1, max_steps=100, goal_tolerance=0.01)
+
+# Receding-horizon (canonical MPC: predict 8 actions, execute 1, replan)
+result = run_closed_loop(predict_fn, execute_fn, initial_obs, config=cfg, goal=goal)
+# result.records: per-step trace; result.success / n_replans / total_steps
+
+# Open-loop baseline: predict once, execute the whole horizon
+baseline = run_open_loop(predict_fn, execute_fn, initial_obs, horizon=100, goal=goal)
+
+# Side-by-side with the same noise schedule
+cmp = compare_loops(predict_fn, lambda: build_world(seed=0), initial_obs, config=cfg, goal=goal)
+print(cmp.closed_final_error, cmp.open_final_error)
+```
+
+The interface is plain callables — `predict_fn(obs, horizon, goal) -> Sequence[action]` and `execute_fn(obs, action) -> (new_obs, info)` — so the same orchestrator drives both the synthetic test fixtures and a real model + sim/hardware loop. `execute_steps` is the chunk size: `1` is canonical MPC (replan after every step); larger values execute K predicted actions before replanning; setting it to `horizon` collapses to open-loop. `max_steps` caps the episode and `goal_tolerance` triggers early termination via the default L2 stop check (override with `stop_fn=` for non-numeric observations).
+
+### Why closed-loop wins
+
+Tests in [`net/control/tests/`](net/control/tests/) lock in two scenarios where replanning beats open-loop on identical noise schedules:
+
+| Scenario | Open-loop final error | Closed-loop final error | Win |
+| --- | --- | --- | --- |
+| Constant drift (+0.3 / step over 30 steps) | 9.00 | 0.60 | 15× |
+| Zero-mean Gaussian noise (std 0.3, 30 steps, 20 seeds avg) | 1.24 | 0.28 | 4.5× |
+
+The drift case has a clean P-control story: the closed-loop controller absorbs the bias each step while the open-loop predictor's internal model has no chance to react. The Gaussian-noise case is the statistical version of the same argument — closed-loop's variance is bounded by a geometric series in the controller gain, while open-loop's variance grows linearly with horizon.
+
+The `HalvingPredictor` and `NoisyWorld` synthetic fixtures used in those tests are exported alongside the orchestrator so they're available in user code:
+
+```python
+from net.control import HalvingPredictor, NoisyWorld, ReplannerConfig, compare_loops
+cmp = compare_loops(
+    HalvingPredictor(fraction=0.5),
+    execute_fn_factory=lambda: NoisyWorld(noise_std=0.3, drift=0.3, seed=0),
+    initial_observation=[0.0],
+    config=ReplannerConfig(horizon=8, execute_steps=1, max_steps=30),
+    goal=[10.0],
+)
+```
+
 ## Ablation Studies
 
 A small declarative ablation framework lives in [`net/ablation/`](net/ablation/) so that "every constraint contributes" claims are reproducible. Each study is a `(base_config, list[AblationConfig], seed)` triple; calling `study.run(evaluator)` produces an [`AblationResults`](net/ablation/ablation.py) table that renders as a paper-ready Markdown table or CSV.
