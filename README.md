@@ -124,6 +124,69 @@ traj = exporter.to_joint_trajectory(joint_positions, dt=0.05)
 
 Tests live alongside the adapter in [`net/ros_adapter/tests/test_exporters.py`](net/ros_adapter/tests/test_exporters.py) and cover per-arm joint-name lookup, planner-knob validation, batch handling, finite-difference Twist derivation (translation, rotation, identity, negative dt), JointTrajectory width / time / count consistency, and end-to-end conversion of a single AC-DiT prediction into all three message types for every supported robot.
 
+## Uncertainty-Aware Action Prediction
+
+[`net/uncertainty/`](net/uncertainty/) adds ensemble sampling and a small library of uncertainty scores over predicted action trajectories. The interface is model-agnostic — anything that yields one candidate trajectory per call works:
+
+```python
+from net.uncertainty import ensemble_predict, mean_std_score
+
+def sample_fn(observation, horizon, goal, sample_id):
+    # caller chooses the source of stochasticity:
+    # - seed an MC dropout pass with sample_id
+    # - pick the sample_id-th model in an ensemble
+    # - run a diffusion sampler with sample_id as the noise seed
+    return predict_one_trajectory(observation, horizon, goal, seed=sample_id)
+
+result = ensemble_predict(sample_fn, observation, horizon=8, n_samples=16)
+# result.mean_actions: [T, D] -- the consensus trajectory
+# result.std_actions:  [T, D] -- per-element std across the ensemble
+# result.samples:      [N, T, D] -- raw samples (kept for downstream analysis)
+# result.score:        scalar -- defaults to mean_std_score
+```
+
+Four scalar scores ship, picked depending on what "uncertain" should mean:
+
+| Score | Use |
+| --- | --- |
+| `mean_std_score` | average disagreement (default; robust to outliers) |
+| `max_std_score` | worst-case disagreement (gate-friendly) |
+| `disagreement_score` | mean pairwise sample distance (no Gaussian assumption) |
+| `diffusion_entropy_score` | differential entropy of a per-step Gaussian fit (mirrors how diffusion models report uncertainty via the noise schedule) |
+
+### Uncertainty-gated replanning
+
+The `make_uncertainty_aware_predict_fn` adapter makes the ensemble drop directly into [`run_closed_loop`](net/control/replanner.py): the closed-loop controller gets the ensemble mean as its predicted action sequence, and an optional gate truncates the horizon to `short_horizon` whenever the score exceeds `score_threshold` — forcing the receding-horizon controller to re-observe sooner under disagreement:
+
+```python
+from net.uncertainty import make_uncertainty_aware_predict_fn
+from net.control import ReplannerConfig, run_closed_loop, NoisyWorld
+
+scores = []
+predict_fn = make_uncertainty_aware_predict_fn(
+    sample_fn,
+    n_samples=8,
+    score_threshold=0.05,   # truncate when mean_std exceeds 5cm equivalent
+    short_horizon=2,
+    record_to=scores,        # per-call score log
+)
+res = run_closed_loop(predict_fn, world, initial_obs,
+                      config=ReplannerConfig(horizon=8, execute_steps=1),
+                      goal=goal)
+```
+
+### What the tests lock in
+
+[`net/uncertainty/tests/`](net/uncertainty/tests/) covers:
+
+- shape / dim invariants and frozen `EnsembleResult` (40 tests total)
+- determinism: same `sample_fn` → byte-identical `mean_actions`, `std_actions`, `score`
+- a deterministic sampler yields zero std and zero score on every defined score function; `n_samples=1` collapses to a single forward pass
+- a noisy sampler's empirical std scales linearly with the injected noise (within ~20% of the 2× ratio); `mean_std_score` and `disagreement_score` follow the same scaling; `max_std ≥ mean_std` always; `diffusion_entropy` is monotonic in noise
+- the gate truncates to `short_horizon` exactly when `score > threshold` and is otherwise a no-op
+- end-to-end: an uncertainty-aware closed-loop run with a noisy sampler still converges to the goal in a noiseless world
+- defensive validation: `sample_fn` returning `None`, wrong-horizon, inconsistent-dim, or zero-dim trajectories all raise loudly
+
 ## Closed-Loop Replanning
 
 [`net/control/`](net/control/) wraps the dynamics predictor into a receding-horizon controller: instead of predicting one long action sequence and executing it open-loop, the replanner re-observes after each step and asks the predictor for a fresh horizon.
