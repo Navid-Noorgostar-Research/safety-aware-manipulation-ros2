@@ -1,67 +1,256 @@
-## A Visual Predictive Model for Topological Manipulation of Deformable Objects
+# Safety-Aware Manipulation of Deformable Objects
+
+**A visual predictive model for topological manipulation of deformable objects — extended into a deployable robotics stack with safety filtering, uncertainty-aware planning, closed-loop replanning and ROS 2 integration.**
+
+[![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-EE4C2C?logo=pytorch&logoColor=white)](https://pytorch.org/)
+[![ROS 2](https://img.shields.io/badge/ROS%202-22314E?logo=ros&logoColor=white)](https://docs.ros.org/)
+[![MoveIt 2](https://img.shields.io/badge/MoveIt%202-0A7CFF)](https://moveit.ros.org/)
+[![Tests](https://img.shields.io/badge/tests-passing-4CAF50)](#testing)
+[![License](https://img.shields.io/badge/license-see%20LICENSE-lightgrey)](LICENSE)
+
+---
+
+Predicting how dough, cloth or tissue will deform under a gripper is only half the problem. The other
+half is what a robot is allowed to **do** with that prediction: whether the commanded action is safe,
+how much the model actually disagrees with itself, when to stop and look again, and how the result
+reaches a real arm.
+
+This repository closes that loop. A geometry–topology autoencoder and dynamics predictor propose the
+next end-effector target; every proposal is then projected onto a safe set, scored for uncertainty,
+folded into a receding-horizon controller, and exported as ROS 2 messages for Franka, KUKA or a mobile
+manipulator.
 
 
-## Researcher — Navid Noorgostar
+## Highlights
 
-## Dependencies
+| Module | What it does | Where |
+|---|---|---|
+| **Safety-aware action filter** | Projects each predicted action onto a safe set through five ordered constraints, before the predictor ever sees it | [`net/model/safety_filter.py`](net/model/safety_filter.py) |
+| **Uncertainty-aware prediction** | Ensemble sampling with four disagreement scores; gates the planning horizon when the model is unsure | [`net/uncertainty/`](net/uncertainty/) |
+| **Closed-loop replanning** | Receding-horizon control that re-observes each step — **15× lower final error** than open-loop under drift | [`net/control/`](net/control/) |
+| **Hardware abstraction** | One `RobotConfig` selector covers `sim`, `franka_mobile`, `kuka_mobile`, `husky_arm` | [`net/hardware/`](net/hardware/) |
+| **ROS 2 / MoveIt 2 export** | `PoseStamped`, MoveIt motion-plan goals, `Twist` for mobile bases, `JointTrajectory` after IK | [`net/ros_adapter/`](net/ros_adapter/) |
+| **Ablation framework** | Declarative studies producing paper-ready Markdown/CSV tables; every constraint shown to contribute | [`net/ablation/`](net/ablation/) |
 
-### Create the conda environment
-- `conda env create -f environment.yml`
+## Pipeline
 
-### Install additional submodules
-- `git submodule init && git submodule update`
-- [nvdiffrast](https://github.com/NVlabs/nvdiffrast): `cd net/nvdiffrast && pip install -e . && cd ../..`
-- [sdftoolbox](https://github.com/cheind/sdftoolbox/): `cd sim/sdftoolbox && pip install -e . && cd ../..`
+```
+   observation
+        │
+        ▼
+ Geometry–Topology Autoencoder  ──►  latent
+        │
+        ▼
+   Dynamics Prediction  ──►  proposed EE action  [x y z qw qx qy qz (open)]
+        │                              │
+        │                              ▼
+        │                 SafetyAwareActionFilter
+        │                 joint · velocity · base speed
+        │                 smoothness · collision margin
+        │                              │
+        ▼                              ▼
+ Uncertainty Ensemble  ─────►  Closed-Loop Replanner
+ N samples → score              predict H, execute K, re-observe
+        │                              │
+        └── score > threshold ─────────┘
+            truncate horizon,
+            look again sooner
+                                       │
+                                       ▼
+                        ROS 2 / MoveIt 2 export layer
+                     Franka · KUKA · Husky · simulation
+```
 
-## Evaluation
-Using the provided weights, the evaluation reproduces the main results from the paper. Note that due to dataset preprocessing and weights trained from scratch using this public code base, the results may vary slightly. Alternatively, train the model from scratch or create a new dataset as described below. Make sure to adapt the paths in the config files accordingly.
-- `python net/prediction.py --config-name dyn "settings.test_only=True"`
+## Contents
 
+[Quick start](#quick-start) · [Training](#training) · [Evaluation](#evaluation) ·
+[Safety filter](#safety-aware-action-filter) · [Uncertainty](#uncertainty-aware-action-prediction) ·
+[Closed-loop replanning](#closed-loop-replanning) · [Hardware](#hardware-abstraction) ·
+[ROS 2](#ros-2-integration) · [Ablations](#ablation-studies) · [Dataset](#dataset-generation) ·
+[Testing](#testing) · [Citation](#citation)
+
+---
+
+## Quick start
+
+```bash
+# 1. environment
+conda env create -f environment.yml
+conda activate <env-name>
+
+# 2. submodules
+git submodule init && git submodule update
+cd net/nvdiffrast && pip install -e . && cd ../..    # NVlabs/nvdiffrast
+cd sim/sdftoolbox && pip install -e . && cd ../..    # cheind/sdftoolbox
+
+# 3. run with the provided weights
+python net/prediction.py --config-name dyn "settings.test_only=True"
+```
+
+Two things you can run immediately, without trained weights:
+
+```bash
+python -m net.ablation.run --study safety_filter     # safety-constraint ablation table
+python -m net.ablation.run --study robot_workspace   # workspace tightness sweep
+```
 
 ## Training
-Using the provided dataset, the autoencoder and the dynamics prediction are trained in two stages, as shown below. Alternatively, generate a custom dataset as described below.
 
-Note that for multi-GPU training, e.g., using 2 GPUs, the `settings.ddp` flag needs to be set in the config. Run the scripts below with `CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 {path_to_script}` instead of `python {path_to_script}`.
+Two stages. Adapt the paths in the config files before switching stages.
 
-### Geometry-topology Autoencoder
-- `python net/prediction.py --config-name ae`
-- This saves the weights in the corresponding hydra output directory (i.e., `outputs/{date}/{time when run was started}/best.pth`). Either copy them to the default path (`weights/ae.pth`), or adapt the `settings.resume_path` in `net/config/dyn.yaml` accordingly before starting the next stage.
+```bash
+python net/prediction.py --config-name ae     # 1. geometry–topology autoencoder
+python net/prediction.py --config-name dyn    # 2. dynamics prediction
+```
 
-### Dynamics Prediction
-- `python net/prediction.py --config-name dyn`
-- Again, the weights are saved in the corresponding hydra output directory. Follow the directions above to make sure that `settings.test_path` points to the desired weights when running subsequent evaluations.
+Weights land in the hydra output directory (`outputs/{date}/{time}/best.pth`). Either copy them to the
+default path (`weights/ae.pth`) or point `settings.resume_path` in `net/config/dyn.yaml` at them before
+starting stage 2 — likewise `settings.test_path` for later evaluation.
 
+Multi-GPU (two GPUs shown): set `settings.ddp` in the config and launch with
 
+```bash
+CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 net/prediction.py --config-name dyn
+```
 
-## Safety-Aware Action Filter
+## Evaluation
 
-After the dynamics predictor proposes a next end-effector (EE) target, the predicted action is passed through a [SafetyAwareActionFilter](net/model/safety_filter.py) that projects it onto a safe set before it is consumed by the model. The filter checks five constraints in order:
+```bash
+python net/prediction.py --config-name dyn "settings.test_only=True"
+```
 
-1. **Joint / workspace limits** – clamps the EE xyz position to a configured workspace box and the gripper opening to its allowed range; the orientation quaternion is re-normalized.
-2. **Velocity limits** – per-DoF caps on linear, angular and gripping velocities (mirrors the simulator's PID `vmax` settings in [sim/generate/config/ee/common.yaml](sim/generate/config/ee/common.yaml)).
-3. **Base speed** – scalar cap on the magnitude of the translational velocity, treating the EE root as a mobile base.
-4. **Action smoothness** – cap on linear acceleration between consecutive commanded targets to suppress jerky motion.
-5. **Collision risk** – pulls the target back along its translation axis when the EE point cloud comes within a configured margin of the dough.
+Reproduces the main results using the provided weights (place them in `weights/{ae,dyn}.pth`). Because of dataset preprocessing and weights
+trained from scratch on this public code base, numbers may vary slightly from the published ones.
 
-Thresholds are configured in [net/config/safety.yaml](net/config/safety.yaml). Set `safety.enabled=False` (or remove the `safety@safety` line from [net/config/common.yaml](net/config/common.yaml)) to bypass the filter.
+---
 
-The filter is applied transparently inside `Pipeline.predict` ([net/pipeline/pipeline.py:163](net/pipeline/pipeline.py#L163)): the predicted EE point cloud target is rigidly translated by the safety correction so the predictor only ever sees actions inside the safe set. Per-batch violation flags are stored under the `safety_info{postfix}` key of the returned data dictionary.
+## Safety-aware action filter
 
-Tests for the filter live in [net/model/tests/test_safety_filter.py](net/model/tests/test_safety_filter.py) (per-check happy-path coverage) and [net/model/tests/test_safety_filter_extended.py](net/model/tests/test_safety_filter_extended.py) (boundary equality, mixed-batch independence, constraint ordering, idempotence, gradient flow, antipodal-quaternion handling, dtype propagation, and 7-D / 8-D shape preservation).
+After the dynamics predictor proposes a next end-effector target, the action passes through
+[`SafetyAwareActionFilter`](net/model/safety_filter.py), which projects it onto a safe set **before the
+model consumes it**. Five constraints are applied in order:
 
-## Hardware Abstraction
+| # | Constraint | Effect |
+|---|---|---|
+| 1 | **Joint / workspace limits** | Clamps EE xyz to a configured workspace box and gripper opening to its range; re-normalises the orientation quaternion |
+| 2 | **Velocity limits** | Per-DoF caps on linear, angular and gripping velocity, mirroring the simulator's PID `vmax` settings |
+| 3 | **Base speed** | Scalar cap on translational velocity magnitude, treating the EE root as a mobile base |
+| 4 | **Action smoothness** | Caps linear acceleration between consecutive targets, suppressing jerky motion |
+| 5 | **Collision risk** | Pulls the target back along its translation axis when the EE point cloud enters a configured margin around the object |
 
-The four supported deployment targets — `sim`, `franka_mobile`, `kuka_mobile`, and `husky_arm` — are described by a single [`RobotConfig`](net/hardware/robot_config.py) dataclass. Each kind ships as a built-in preset and a YAML file under [`net/config/robot/`](net/config/robot/), and consumers (the ROS2 adapter and the safety filter) read the same config so that changing the target robot only requires changing one selector:
+Thresholds live in [`net/config/safety.yaml`](net/config/safety.yaml). Bypass with
+`safety.enabled=False`, or remove the `safety@safety` line from
+[`net/config/common.yaml`](net/config/common.yaml).
+
+The filter is applied transparently inside `Pipeline.predict`
+([`net/pipeline/pipeline.py:163`](net/pipeline/pipeline.py#L163)): the predicted EE point-cloud target is
+rigidly translated by the safety correction, so the predictor only ever observes actions inside the safe
+set. Per-batch violation flags are returned under the `safety_info{postfix}` key.
+
+## Uncertainty-aware action prediction
+
+[`net/uncertainty/`](net/uncertainty/) adds ensemble sampling and a small library of uncertainty scores
+over predicted action trajectories. The interface is model-agnostic — anything yielding one candidate
+trajectory per call works, whether that is MC dropout, a model ensemble or a diffusion sampler.
+
+```python
+from net.uncertainty import ensemble_predict, mean_std_score
+
+def sample_fn(observation, horizon, goal, sample_id):
+    # sample_id seeds MC dropout, selects the ensemble member,
+    # or seeds the diffusion sampler — caller's choice
+    return predict_one_trajectory(observation, horizon, goal, seed=sample_id)
+
+result = ensemble_predict(sample_fn, observation, horizon=8, n_samples=16)
+# result.mean_actions [T, D] · std_actions [T, D] · samples [N, T, D] · score (scalar)
+```
+
+Four scores ship, depending on what "uncertain" should mean:
+
+| Score | Use |
+|---|---|
+| `mean_std_score` | Average disagreement — default, robust to outliers |
+| `max_std_score` | Worst-case disagreement — gate-friendly |
+| `disagreement_score` | Mean pairwise sample distance — no Gaussian assumption |
+| `diffusion_entropy_score` | Differential entropy of a per-step Gaussian fit, mirroring how diffusion models report uncertainty through the noise schedule |
+
+### Uncertainty-gated replanning
+
+`make_uncertainty_aware_predict_fn` drops the ensemble straight into
+[`run_closed_loop`](net/control/replanner.py). The controller receives the ensemble mean as its action
+sequence, and an optional gate truncates the horizon whenever the score exceeds a threshold — forcing
+the robot to re-observe sooner precisely when its own model disagrees with itself.
+
+```python
+from net.uncertainty import make_uncertainty_aware_predict_fn
+from net.control import ReplannerConfig, run_closed_loop
+
+scores = []
+predict_fn = make_uncertainty_aware_predict_fn(
+    sample_fn,
+    n_samples=8,
+    score_threshold=0.05,   # truncate above 5 cm equivalent disagreement
+    short_horizon=2,
+    record_to=scores,       # per-call score log
+)
+res = run_closed_loop(predict_fn, world, initial_obs,
+                      config=ReplannerConfig(horizon=8, execute_steps=1), goal=goal)
+```
+
+## Closed-loop replanning
+
+[`net/control/`](net/control/) wraps the dynamics predictor into a receding-horizon controller: rather
+than predicting one long sequence and executing it blind, it re-observes and asks for a fresh horizon.
+
+```python
+from net.control import ReplannerConfig, run_closed_loop, run_open_loop, compare_loops
+
+cfg = ReplannerConfig(horizon=8, execute_steps=1, max_steps=100, goal_tolerance=0.01)
+
+result   = run_closed_loop(predict_fn, execute_fn, initial_obs, config=cfg, goal=goal)
+baseline = run_open_loop(predict_fn, execute_fn, initial_obs, horizon=100, goal=goal)
+cmp      = compare_loops(predict_fn, lambda: build_world(seed=0), initial_obs, config=cfg, goal=goal)
+```
+
+The interface is plain callables — `predict_fn(obs, horizon, goal) -> Sequence[action]` and
+`execute_fn(obs, action) -> (new_obs, info)` — so the same orchestrator drives synthetic fixtures and a
+real model on hardware. `execute_steps=1` is canonical MPC; setting it to `horizon` collapses to
+open-loop.
+
+### Why closed-loop wins
+
+Measured on identical noise schedules ([`net/control/tests/`](net/control/tests/)):
+
+| Scenario | Open-loop error | Closed-loop error | Improvement |
+|---|---:|---:|---:|
+| Constant drift (+0.3/step, 30 steps) | 9.00 | 0.60 | **15×** |
+| Gaussian noise (σ = 0.3, 30 steps, 20 seeds) | 1.24 | 0.28 | **4.5×** |
+
+The drift case has a clean P-control story: the closed-loop controller absorbs the bias each step, while
+the open-loop predictor's internal model never gets the chance to react. The Gaussian case is the
+statistical version of the same argument — closed-loop variance is bounded by a geometric series in the
+controller gain, whereas open-loop variance grows linearly with the horizon.
+
+## Hardware abstraction
+
+Four deployment targets — `sim`, `franka_mobile`, `kuka_mobile`, `husky_arm` — are described by one
+[`RobotConfig`](net/hardware/robot_config.py) dataclass. Both the ROS 2 adapter and the safety filter
+read the same config, so retargeting hardware means changing one selector:
 
 ```python
 from net.hardware import load_robot_config
 from net.ros_adapter import EEActionToROS2
 
-cfg = load_robot_config("franka_mobile")            # or "kuka_mobile" / "husky_arm" / "sim"
-adapter = EEActionToROS2.from_robot_config(cfg)     # uses cfg.base_frame_id and cfg.sim_to_meter
+cfg     = load_robot_config("franka_mobile")     # or kuka_mobile / husky_arm / sim
+adapter = EEActionToROS2.from_robot_config(cfg)  # uses cfg.base_frame_id, cfg.sim_to_meter
 ```
 
-A `RobotConfig` captures: arm kind and DoF, base frame name, EE / gripper / base-velocity topics, sim-to-meter scaling, mobile-base presence, and a `safety` block of optional overrides on top of [`net/config/safety.yaml`](net/config/safety.yaml). Mobile-base kinds (`franka_mobile`, `kuka_mobile`, `husky_arm`) declare a `base_cmd_topic` for `geometry_msgs/Twist` commands and a wider workspace; the fixed-base `sim` kind keeps the tabletop defaults. YAML files may reuse a preset and override only the fields that differ:
+A `RobotConfig` captures arm kind and DoF, base frame, EE/gripper/base-velocity topics, sim-to-metre
+scaling, mobile-base presence, and a `safety` block overriding
+[`net/config/safety.yaml`](net/config/safety.yaml). Mobile kinds declare a `base_cmd_topic` for
+`geometry_msgs/Twist` and a wider workspace; fixed-base `sim` keeps tabletop defaults. YAML files may
+extend a preset and override only what differs:
 
 ```yaml
 # my_franka_lab.yaml
@@ -71,234 +260,81 @@ safety:
   v_lin_max: 0.3
 ```
 
-Then `load_robot_config("path/to/my_franka_lab.yaml")` returns a config built on top of the `franka_mobile` preset. Tests live under [`net/hardware/tests/`](net/hardware/tests/) and cover preset registration, YAML round-trips, validation, safety-override merging, and the ROS2-adapter integration for all four kinds.
+## ROS 2 integration
 
-## ROS2 Integration
+[`net/ros_adapter`](net/ros_adapter/) forwards the filtered action to a real robot:
 
-The filtered EE target action can be forwarded to a real robot via the [`net/ros_adapter`](net/ros_adapter/) package. It exposes:
-
-- A pure-Python converter ([`EEActionToROS2`](net/ros_adapter/adapter.py)) that maps the predicted action (`[B, 7]` or `[B, 8]`, layout `[x, y, z, qw, qx, qy, qz, (open)]`) into `geometry_msgs/PoseStamped` dataclasses. It handles the sim-units → meters scaling (default `0.2`, matching the project convention) and the quaternion convention swap (model is scalar-first `[w, x, y, z]`; ROS2 is scalar-last `[x, y, z, w]`). No `rclpy` dependency, so it stays usable in any inference / CI environment.
-- A first-class `rclpy` publisher ([`EEPoseBridge`](net/ros_adapter/node.py)) that wraps the converter and publishes on a configurable topic. Hard-tested against MoveIt 2 (`move_group` and Servo) and Franka Cartesian impedance interfaces; KUKA `iiwa_ros2` follows the same pattern with a different `frame_id`.
-- A test suite under [`net/ros_adapter/tests/`](net/ros_adapter/tests/) covering unit scaling, quaternion order swap, batch handling, and defensive re-normalization.
-
-Minimal usage from an inference loop:
+- **[`EEActionToROS2`](net/ros_adapter/adapter.py)** — pure-Python converter mapping the predicted action
+  (`[B, 7]` or `[B, 8]`, layout `[x, y, z, qw, qx, qy, qz, (open)]`) into `geometry_msgs/PoseStamped`
+  dataclasses. Handles sim-units → metres scaling and the quaternion convention swap (model is
+  scalar-first, ROS 2 is scalar-last). No `rclpy` dependency, so it runs in any inference or CI
+  environment.
+- **[`EEPoseBridge`](net/ros_adapter/node.py)** — a real `rclpy` publisher wrapping the converter. Tested
+  against MoveIt 2 (`move_group` and Servo) and Franka Cartesian impedance interfaces; KUKA `iiwa_ros2`
+  follows the same pattern with a different `frame_id`.
 
 ```python
 from net.ros_adapter import EEActionToROS2
 adapter = EEActionToROS2(frame_id="panda_link0")
-target = pipeline.predict(batch)["ee_target_nxt"]
-poses = adapter.to_pose_stamped(target)   # list[PoseStamped]
+poses   = adapter.to_pose_stamped(pipeline.predict(batch)["ee_target_nxt"])
 ```
 
-See [`net/ros_adapter/README.md`](net/ros_adapter/README.md) for hardware-specific notes (Franka, KUKA, MoveIt Servo) and the full streaming example with `EEPoseBridge`.
+### MoveIt 2 / Twist / JointTrajectory export
 
-### MoveIt2 / Twist / JointTrajectory export layer
-
-For pipelines that need richer ROS2 message types than a single `PoseStamped`, [`MoveIt2Exporter`](net/ros_adapter/exporters.py) wraps the AC-DiT output into the four channels a real ROS2 stack actually consumes:
+[`MoveIt2Exporter`](net/ros_adapter/exporters.py) wraps the model output into the four channels a real
+ROS 2 stack consumes:
 
 | Output | Use case | Method |
-| --- | --- | --- |
-| `geometry_msgs/PoseStamped` | direct Cartesian impedance / Servo target | `to_pose_stamped` |
-| `MoveItPoseGoal` (subset of `moveit_msgs/MotionPlanRequest`) | MoveIt2 motion-plan request with planner knobs | `to_pose_goal` |
-| `geometry_msgs/Twist` / `TwistStamped` | mobile-base `cmd_vel` | `to_twist`, `to_twist_stamped`, `twist_from_action_pair` |
-| `trajectory_msgs/JointTrajectory` | joint-space waypoints (post-IK) | `to_joint_trajectory` |
-
-Per-arm defaults — joint names, MoveIt group, end-effector link — come from the robot config, so swapping target hardware only changes the selector:
+|---|---|---|
+| `geometry_msgs/PoseStamped` | Cartesian impedance / Servo target | `to_pose_stamped` |
+| `MoveItPoseGoal` | MoveIt 2 motion-plan request with planner knobs | `to_pose_goal` |
+| `geometry_msgs/Twist` | Mobile-base `cmd_vel` | `to_twist`, `twist_from_action_pair` |
+| `trajectory_msgs/JointTrajectory` | Joint-space waypoints, post-IK | `to_joint_trajectory` |
 
 ```python
 from net.ros_adapter import MoveIt2Exporter
-
 exporter = MoveIt2Exporter.from_robot_config("franka_mobile")
 
-# 1) MoveIt2 motion-plan goal (Cartesian)
-goal = exporter.to_pose_goal(action, max_velocity_scaling_factor=0.5)[0]
-# goal.group_name == "panda_arm", goal.target_pose.header.frame_id == "panda_link0"
-
-# 2) Twist for the mobile base, derived from two consecutive predictions
+goal  = exporter.to_pose_goal(action, max_velocity_scaling_factor=0.5)[0]
 twist = exporter.twist_from_action_pair(prev_action, next_action, dt=0.1)
-
-# 3) JointTrajectory after running IK (joint_positions: [T, J])
-traj = exporter.to_joint_trajectory(joint_positions, dt=0.05)
-# traj.joint_names == ["panda_joint1", ..., "panda_joint7"]
+traj  = exporter.to_joint_trajectory(joint_positions, dt=0.05)
 ```
 
-Tests live alongside the adapter in [`net/ros_adapter/tests/test_exporters.py`](net/ros_adapter/tests/test_exporters.py) and cover per-arm joint-name lookup, planner-knob validation, batch handling, finite-difference Twist derivation (translation, rotation, identity, negative dt), JointTrajectory width / time / count consistency, and end-to-end conversion of a single AC-DiT prediction into all three message types for every supported robot.
+Per-arm defaults — joint names, MoveIt group, end-effector link — come from the robot config, so
+swapping hardware changes only the selector. See
+[`net/ros_adapter/README.md`](net/ros_adapter/README.md) for hardware-specific notes.
 
-## Uncertainty-Aware Action Prediction
+## Ablation studies
 
-[`net/uncertainty/`](net/uncertainty/) adds ensemble sampling and a small library of uncertainty scores over predicted action trajectories. The interface is model-agnostic — anything that yields one candidate trajectory per call works:
-
-```python
-from net.uncertainty import ensemble_predict, mean_std_score
-
-def sample_fn(observation, horizon, goal, sample_id):
-    # caller chooses the source of stochasticity:
-    # - seed an MC dropout pass with sample_id
-    # - pick the sample_id-th model in an ensemble
-    # - run a diffusion sampler with sample_id as the noise seed
-    return predict_one_trajectory(observation, horizon, goal, seed=sample_id)
-
-result = ensemble_predict(sample_fn, observation, horizon=8, n_samples=16)
-# result.mean_actions: [T, D] -- the consensus trajectory
-# result.std_actions:  [T, D] -- per-element std across the ensemble
-# result.samples:      [N, T, D] -- raw samples (kept for downstream analysis)
-# result.score:        scalar -- defaults to mean_std_score
-```
-
-Four scalar scores ship, picked depending on what "uncertain" should mean:
-
-| Score | Use |
-| --- | --- |
-| `mean_std_score` | average disagreement (default; robust to outliers) |
-| `max_std_score` | worst-case disagreement (gate-friendly) |
-| `disagreement_score` | mean pairwise sample distance (no Gaussian assumption) |
-| `diffusion_entropy_score` | differential entropy of a per-step Gaussian fit (mirrors how diffusion models report uncertainty via the noise schedule) |
-
-### Uncertainty-gated replanning
-
-The `make_uncertainty_aware_predict_fn` adapter makes the ensemble drop directly into [`run_closed_loop`](net/control/replanner.py): the closed-loop controller gets the ensemble mean as its predicted action sequence, and an optional gate truncates the horizon to `short_horizon` whenever the score exceeds `score_threshold` — forcing the receding-horizon controller to re-observe sooner under disagreement:
-
-```python
-from net.uncertainty import make_uncertainty_aware_predict_fn
-from net.control import ReplannerConfig, run_closed_loop, NoisyWorld
-
-scores = []
-predict_fn = make_uncertainty_aware_predict_fn(
-    sample_fn,
-    n_samples=8,
-    score_threshold=0.05,   # truncate when mean_std exceeds 5cm equivalent
-    short_horizon=2,
-    record_to=scores,        # per-call score log
-)
-res = run_closed_loop(predict_fn, world, initial_obs,
-                      config=ReplannerConfig(horizon=8, execute_steps=1),
-                      goal=goal)
-```
-
-### What the tests lock in
-
-[`net/uncertainty/tests/`](net/uncertainty/tests/) covers:
-
-- shape / dim invariants and frozen `EnsembleResult` (40 tests total)
-- determinism: same `sample_fn` → byte-identical `mean_actions`, `std_actions`, `score`
-- a deterministic sampler yields zero std and zero score on every defined score function; `n_samples=1` collapses to a single forward pass
-- a noisy sampler's empirical std scales linearly with the injected noise (within ~20% of the 2× ratio); `mean_std_score` and `disagreement_score` follow the same scaling; `max_std ≥ mean_std` always; `diffusion_entropy` is monotonic in noise
-- the gate truncates to `short_horizon` exactly when `score > threshold` and is otherwise a no-op
-- end-to-end: an uncertainty-aware closed-loop run with a noisy sampler still converges to the goal in a noiseless world
-- defensive validation: `sample_fn` returning `None`, wrong-horizon, inconsistent-dim, or zero-dim trajectories all raise loudly
-
-## Closed-Loop Replanning
-
-[`net/control/`](net/control/) wraps the dynamics predictor into a receding-horizon controller: instead of predicting one long action sequence and executing it open-loop, the replanner re-observes after each step and asks the predictor for a fresh horizon.
-
-```python
-from net.control import ReplannerConfig, run_closed_loop, run_open_loop, compare_loops
-
-cfg = ReplannerConfig(horizon=8, execute_steps=1, max_steps=100, goal_tolerance=0.01)
-
-# Receding-horizon (canonical MPC: predict 8 actions, execute 1, replan)
-result = run_closed_loop(predict_fn, execute_fn, initial_obs, config=cfg, goal=goal)
-# result.records: per-step trace; result.success / n_replans / total_steps
-
-# Open-loop baseline: predict once, execute the whole horizon
-baseline = run_open_loop(predict_fn, execute_fn, initial_obs, horizon=100, goal=goal)
-
-# Side-by-side with the same noise schedule
-cmp = compare_loops(predict_fn, lambda: build_world(seed=0), initial_obs, config=cfg, goal=goal)
-print(cmp.closed_final_error, cmp.open_final_error)
-```
-
-The interface is plain callables — `predict_fn(obs, horizon, goal) -> Sequence[action]` and `execute_fn(obs, action) -> (new_obs, info)` — so the same orchestrator drives both the synthetic test fixtures and a real model + sim/hardware loop. `execute_steps` is the chunk size: `1` is canonical MPC (replan after every step); larger values execute K predicted actions before replanning; setting it to `horizon` collapses to open-loop. `max_steps` caps the episode and `goal_tolerance` triggers early termination via the default L2 stop check (override with `stop_fn=` for non-numeric observations).
-
-### Why closed-loop wins
-
-Tests in [`net/control/tests/`](net/control/tests/) lock in two scenarios where replanning beats open-loop on identical noise schedules:
-
-| Scenario | Open-loop final error | Closed-loop final error | Win |
-| --- | --- | --- | --- |
-| Constant drift (+0.3 / step over 30 steps) | 9.00 | 0.60 | 15× |
-| Zero-mean Gaussian noise (std 0.3, 30 steps, 20 seeds avg) | 1.24 | 0.28 | 4.5× |
-
-The drift case has a clean P-control story: the closed-loop controller absorbs the bias each step while the open-loop predictor's internal model has no chance to react. The Gaussian-noise case is the statistical version of the same argument — closed-loop's variance is bounded by a geometric series in the controller gain, while open-loop's variance grows linearly with horizon.
-
-The `HalvingPredictor` and `NoisyWorld` synthetic fixtures used in those tests are exported alongside the orchestrator so they're available in user code:
-
-```python
-from net.control import HalvingPredictor, NoisyWorld, ReplannerConfig, compare_loops
-cmp = compare_loops(
-    HalvingPredictor(fraction=0.5),
-    execute_fn_factory=lambda: NoisyWorld(noise_std=0.3, drift=0.3, seed=0),
-    initial_observation=[0.0],
-    config=ReplannerConfig(horizon=8, execute_steps=1, max_steps=30),
-    goal=[10.0],
-)
-```
-
-## Ablation Studies
-
-A small declarative ablation framework lives in [`net/ablation/`](net/ablation/) so that "every constraint contributes" claims are reproducible. Each study is a `(base_config, list[AblationConfig], seed)` triple; calling `study.run(evaluator)` produces an [`AblationResults`](net/ablation/ablation.py) table that renders as a paper-ready Markdown table or CSV.
-
-Three studies ship:
-
-- [`safety_filter_study`](net/ablation/presets.py) — ablates each of the five safety constraints (joint, velocity, base speed, smoothness, collision) plus a `disabled` lower bound. The `safety_filter_evaluator` runs the actual `SafetyAwareActionFilter` on a seeded synthetic dataset that spans every violation mode and reports per-constraint flag rates and mean L2 correction magnitude.
-- [`robot_workspace_study`](net/ablation/presets.py) — sweeps workspace tightness on the default tabletop robot.
-- [`model_ablation_study`](net/ablation/presets.py) — ablates **3D input**, **mobility-to-body conditioning**, and the **safety filter** on the action path. Ships scaffolded: until you register a model runner via `set_model_runner`, the evaluator returns `NaN` for every metric so the table layout is reproducible without trained weights or a dataset on the current machine. Plug in your runner on the lab box to fill in the cells.
-
-Run from the CLI:
+[`net/ablation/`](net/ablation/) is a declarative framework, so that "every constraint contributes" is a
+reproducible claim rather than an assertion. A study is a `(base_config, list[AblationConfig], seed)`
+triple; `study.run(evaluator)` returns a table rendering as paper-ready Markdown or CSV.
 
 ```bash
 python -m net.ablation.run --study safety_filter
 python -m net.ablation.run --study robot_workspace --format csv --out results.csv
-python -m net.ablation.run --study safety_filter --seed 42 --out ablation.md
-python -m net.ablation.run --study model_ablation     # NaN cells until runner registered
+python -m net.ablation.run --study model_ablation      # NaN cells until a runner is registered
 ```
 
-Example output (seed 0):
+Example output (seed 0), abbreviated:
 
-```
-## Ablation: safety_filter
-seed: 0
+| Ablation | joint | velocity | base speed | smoothness | collision | mean correction |
+|---|---:|---:|---:|---:|---:|---:|
+| `full` | 0.844 | 1.000 | 1.000 | 0.594 | 0.500 | 0.313 |
+| `no_joint_limits` | **0.000** | 1.000 | 0.996 | 0.504 | 0.500 | 0.304 |
+| `no_velocity_limits` | 0.789 | **0.000** | 1.000 | 0.746 | 0.500 | 0.309 |
+| `no_base_speed` | 0.777 | 1.000 | **0.000** | 1.000 | 0.500 | 0.304 |
+| `no_smoothness` | 0.777 | 1.000 | 1.000 | **0.000** | 0.500 | 0.277 |
+| `no_collision` | 0.805 | 1.000 | 1.000 | 0.582 | **0.000** | 0.303 |
+| `disabled` | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 |
 
-| Ablation           | joint_violations | velocity_violations | base_speed_violations | smoothness_violations | collision_violations | any_violations | mean_correction | Description                            |
-| ------------------ | ---------------- | ------------------- | --------------------- | --------------------- | -------------------- | -------------- | --------------- | -------------------------------------- |
-| full               | 0.8438           | 1.0000              | 1.0000                | 0.5938                | 0.5000               | 1.0000         | 0.3130          | all five constraints active (baseline) |
-| no_joint_limits    | 0.0000           | 1.0000              | 0.9961                | 0.5039                | 0.5000               | 1.0000         | 0.3043          | disable workspace + gripper clamps     |
-| no_velocity_limits | 0.7891           | 0.0000              | 1.0000                | 0.7461                | 0.5000               | 1.0000         | 0.3087          | disable per-DoF velocity caps          |
-| no_base_speed      | 0.7773           | 1.0000              | 0.0000                | 1.0000                | 0.5000               | 1.0000         | 0.3037          | disable scalar |xyz| velocity cap      |
-| no_smoothness      | 0.7773           | 1.0000              | 1.0000                | 0.0000                | 0.5000               | 1.0000         | 0.2767          | disable acceleration smoothness cap    |
-| no_collision       | 0.8047           | 1.0000              | 1.0000                | 0.5820                | 0.0000               | 1.0000         | 0.3026          | disable collision pullback             |
-| disabled           | 0.0000           | 0.0000              | 0.0000                | 0.0000                | 0.0000               | 0.0000         | 0.0000          | bypass filter entirely (lower bound)   |
-```
+Each `no_X` row drops only its own constraint to zero while the others keep firing on the same seeded
+data. **The zero diagonal is the evidence** that each check contributes independently.
 
-Each `no_X` row drops only its own constraint to 0 while leaving the others firing on the same seeded data — the visible diagonal is the evidence that each check contributes independently. Tests in [`net/ablation/tests/`](net/ablation/tests/) lock in this property along with framework-level invariants (declaration-order stability, per-row seed independence, deterministic reruns, strict-mode unknown-key validation, Markdown/CSV column alignment, evaluator type checks).
-
-### Model ablation (3D input / mobility-to-body / safety filter)
-
-[`model_ablation_study`](net/ablation/presets.py) ships scaffolded with four rows:
-
-| Ablation | Override | Means |
-| --- | --- | --- |
-| `full` | _(none)_ | full model: 4-dim input + both-EE conditioning + safety filter |
-| `no_3d_input` | `input_dim: 1` | drop the spatial xyz channels (keep per-point label only) |
-| `no_mobility_conditioning` | `ee_conditioning: 'observed'` | drop target-EE conditioning (no mobility→body coupling) |
-| `no_safety_filter` | `safety_enabled: False` | bypass `SafetyAwareActionFilter` on the action path |
-
-Until you call `set_model_runner(...)`, every cell renders as `NaN`. To plug in a real run, register a callable that takes the merged effective config (a flat dict containing the keys above) and a per-row seed, and returns a dict with exactly the keys in `MODEL_METRIC_NAMES` (`chamfer_l1`, `iou`, `topology_accuracy`, `safety_violation_rate`, `mean_correction`):
-
-```python
-from net.ablation import set_model_runner, model_ablation_evaluator, model_ablation_study
-
-def my_runner(cfg, seed):
-    pipeline = build_pipeline(input_dim=cfg["input_dim"],
-                              ee_shape=cfg["ee_conditioning"],
-                              safety_enabled=cfg["safety_enabled"])
-    return evaluate_on_held_out(pipeline, seed)   # returns the 5 keys
-
-set_model_runner(my_runner)
-print(model_ablation_study(seed=0).run(model_ablation_evaluator).to_markdown())
-```
-
-The evaluator validates the runner's output (missing or extra keys raise immediately), so a misconfigured run on the lab box fails loudly rather than silently producing a half-filled table.
+Three studies ship: `safety_filter_study` (five constraints plus a disabled lower bound),
+`robot_workspace_study` (workspace tightness sweep), and `model_ablation_study` (3D input,
+mobility-to-body conditioning, safety filter — scaffolded, returning `NaN` until you register a runner
+with `set_model_runner`, so the table layout is reproducible without weights on the current machine).
 
 Custom studies are a one-liner:
 
@@ -308,26 +344,84 @@ from net.ablation import AblationConfig, AblationStudy, safety_filter_evaluator
 study = AblationStudy(
     name="my_collision_sweep",
     base_config={...},
-    ablations=[
-        AblationConfig("margin_1mm",  overrides={"collision_margin": 0.001}),
-        AblationConfig("margin_5mm",  overrides={"collision_margin": 0.005}),
-        AblationConfig("margin_10mm", overrides={"collision_margin": 0.01}),
-    ],
+    ablations=[AblationConfig(f"margin_{m}mm", overrides={"collision_margin": m / 1000})
+               for m in (1, 5, 10)],
     seed=0,
 )
 print(study.run(safety_filter_evaluator).to_markdown())
 ```
 
-## Generation
-Our simulation with topology annotation may be used to generate additional scenes or completely new datasets. 
+## Dataset generation
 
-To this end, first, derive novel scene definitions from `template.yaml`, e.g., by adapting `to_pos` and `to_quat` (grasp pose), or `close_d` (final opening width).
+The simulation with topology annotation can generate additional scenes or entirely new datasets. Derive
+scene definitions from `template.yaml`, adapting `to_pos` and `to_quat` (grasp pose) or `close_d` (final
+opening width).
 
-### Simulation
-- `python sim/generate.py`
-- This will create a `log.pkl` with particle-based information (and `visualization.gif` if `render=True` in config) in the scene directory.
+```bash
+python sim/generate.py   # → log.pkl with particle information (+ visualization.gif if render=True)
+python sim/process.py    # → data.h5 with mesh-based information, processed in parallel
+```
 
-### Processing
-- `python sim/process.py`
-- This will process the simulated scenes in parallel and create `data.h5` with additional mesh-based information.
+## Testing
 
+Every module ships with tests, and they encode behaviour rather than just coverage:
+
+| Suite | What it locks in |
+|---|---|
+| [`net/model/tests/`](net/model/tests/) | Per-constraint happy paths; boundary equality, mixed-batch independence, constraint ordering, idempotence, gradient flow, antipodal quaternions, dtype propagation, 7-D/8-D shape preservation |
+| [`net/uncertainty/tests/`](net/uncertainty/tests/) | 40 tests: byte-level determinism, zero score for deterministic samplers, empirical std scaling linearly with injected noise (within ~20 % of the 2× ratio), `max_std ≥ mean_std` always, gate firing exactly at threshold, loud failure on malformed `sample_fn` output |
+| [`net/control/tests/`](net/control/tests/) | The drift and Gaussian-noise comparisons above, on fixed seeds |
+| [`net/hardware/tests/`](net/hardware/tests/) | Preset registration, YAML round-trips, validation, safety-override merging, adapter integration for all four robot kinds |
+| [`net/ros_adapter/tests/`](net/ros_adapter/tests/) | Unit scaling, quaternion order swap, batch handling, finite-difference Twist derivation, JointTrajectory consistency, end-to-end conversion for every supported robot |
+| [`net/ablation/tests/`](net/ablation/tests/) | Declaration-order stability, per-row seed independence, deterministic reruns, strict-mode key validation, Markdown/CSV column alignment |
+
+```bash
+pytest net/
+```
+
+## Citation
+
+```bibtex
+@software{noorgostar_safety_aware_manipulation,
+  author = {Noorgostar, Navid},
+  title  = {Safety-Aware Manipulation of Deformable Objects},
+  year   = {2026},
+  url    = {https://github.com/Navid-Noorgostar-Research/safety-aware-manipulation-ros2}
+}
+```
+
+Please also cite the underlying predictive model:
+
+```bibtex
+@inproceedings{bauer2024doughnet,
+  title     = {DoughNet: A Visual Predictive Model for Topological Manipulation of Deformable Objects},
+  author    = {Bauer, Dominik and Xu, Zhenjia and Song, Shuran},
+  booktitle = {European Conference on Computer Vision (ECCV)},
+  pages     = {92--108},
+  year      = {2024},
+  doi       = {10.1007/978-3-031-72940-9_6}
+}
+```
+
+## Acknowledgements
+
+This work builds directly on **[DoughNet](https://dough-net.github.io/)** by Dominik Bauer, Zhenjia Xu
+and Shuran Song (Columbia University and Stanford University), presented at ECCV 2024 —
+[paper](https://link.springer.com/chapter/10.1007/978-3-031-72940-9_6) ·
+[project page](https://dough-net.github.io/) · [code](https://github.com/dornik/doughnet).
+The denoising autoencoder, the autoregressive latent dynamics model and the topology-annotated
+simulator are theirs; this repository adds the deployment layer around them.
+
+Also built on [nvdiffrast](https://github.com/NVlabs/nvdiffrast) (NVlabs) and
+[sdftoolbox](https://github.com/cheind/sdftoolbox) (cheind).
+
+## Contact
+
+**Navid Noorgostar** — navid.noorgostar22@gmail.com
+
+Contact modelling and grasp planning for deformable objects · learning-based manipulation with
+simulation-to-reality transfer · safety filtering of commanded actions.
+
+## License
+
+See [LICENSE](LICENSE).
